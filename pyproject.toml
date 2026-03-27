@@ -1,0 +1,11 @@
+[project]
+name = "fno-pinn"
+version = "0.1.0"
+description = "Project for Programming Practical on FNOs vs PINNs"
+readme = "README.md"
+dependencies = [
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.8",
+    "torch>=2.11.0",
+]
