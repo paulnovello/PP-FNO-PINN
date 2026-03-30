@@ -22,18 +22,18 @@ def domain_bounds(col):
     return float(torch.min(col).item()), float(torch.max(col).item())
 
 
-def numpy_interpolator(device, x, domain, y):
+def numpy_interpolator(x, domain, y):
     interpolated = np.interp(
         x.detach().clone().cpu().numpy().flatten(),
         domain.detach().clone().cpu().numpy().flatten(),
         y.detach().clone().cpu().numpy().flatten(),
     )
-    return torch.from_numpy(interpolated).view(-1, 1).to(device)
+    return torch.from_numpy(interpolated).view(-1, 1)
 
 
-def bathymetry_interpolator(device, x):
-    b = numpy_interpolator(device, x, bathy_x, bathy)
-    b_prime = numpy_interpolator(device, x, bathy_x, bathy_prime)
+def bathymetry_interpolator(x):
+    b = numpy_interpolator(x, bathy_x, bathy)
+    b_prime = numpy_interpolator(x, bathy_x, bathy_prime)
     return b, b_prime
 
 
@@ -43,7 +43,7 @@ def Ks_function(x, k, col):
         return k.view(1, 1).expand(x.shape[0], 1)
 
     x_min, x_max = domain_bounds(col)
-    subdomains = torch.linspace(x_min, x_max, k.numel(), device=x.device)
+    subdomains = torch.linspace(x_min, x_max, k.numel())
     subdomain_sizes = subdomains[1:] - subdomains[:-1]
     flat_x = x.view(-1)
 
@@ -56,7 +56,7 @@ def Ks_function(x, k, col):
     return values.view(-1, 1)
 
 
-def compute_ref_solution(model, col, k, dx):
+def compute_ref_solution(col, k, dx):
     if regime != "subcritical":
         raise NotImplementedError("Only the subcritical regime is supported.")
 
@@ -65,17 +65,16 @@ def compute_ref_solution(model, col, k, dx):
         x_min,
         x_max,
         int((x_max - x_min) / dx),
-        device=model.device,
     ).view(-1, 1)
 
-    bathymetry = bathymetry_interpolator(model.device, domain)[0]
-    slope = -bathymetry_interpolator(model.device, domain)[1]
+    bathymetry = bathymetry_interpolator(domain)[0]
+    slope = -bathymetry_interpolator(domain)[1]
     k = k.float()
 
     def backwater_model(x, h, parameter):
         froude = q / (g * h**3) ** (1 / 2)
         return -(
-            numpy_interpolator(model.device, x, domain, slope)
+            numpy_interpolator(x, domain, slope)
             - (q / parameter) ** 2 / h ** (10 / 3)
         ) / (1 - froude**2)
 
@@ -87,7 +86,7 @@ def compute_ref_solution(model, col, k, dx):
                 (
                     q**2
                     / (
-                        numpy_interpolator(model.device, domain[index], domain, slope)
+                        numpy_interpolator(domain[index], domain, slope)
                         * Ks_function(domain[index], parameter_values, col) ** 2
                     )
                 )
@@ -119,7 +118,7 @@ def compute_ref_solution(model, col, k, dx):
 
             list_h.append((list_h[-1] + dx / 6 * (k1 + 2 * k2 + 2 * k3 + k4)).item())
 
-            local_slope = numpy_interpolator(model.device, domain[index], domain, slope)
+            local_slope = numpy_interpolator(domain[index], domain, slope)
             if local_slope < 0:
                 list_hn.append(np.nan)
             else:
@@ -147,9 +146,9 @@ def compute_ref_solution(model, col, k, dx):
 
     solution, normal_height = rk4_integrator(k)
 
-    h = torch.tensor(solution.copy(), device=model.device)
-    h_n = torch.tensor(normal_height.copy(), device=model.device)
-    h_c = hc * torch.ones(domain.shape[0], 1, device=model.device)
+    h = torch.tensor(solution.copy())
+    h_n = torch.tensor(normal_height.copy())
+    h_c = hc * torch.ones(domain.shape[0], 1)
 
     return {
         "solution": h,
@@ -157,7 +156,7 @@ def compute_ref_solution(model, col, k, dx):
         "critical height": h_c,
         "normal height": h_n,
         "bathymetry": bathymetry,
-        "bathymetry_col": bathymetry_interpolator(model.device, col)[0],
+        "bathymetry_col": bathymetry_interpolator(col)[0],
         "domain": domain,
         "parameter": k,
         "parameter_function": Ks_function(domain, k, col),

@@ -1,54 +1,142 @@
 import time
-from dataclasses import dataclass
-from functools import partial
 
 import torch
 import torch.nn as nn
 
-from losses import (
-    LossNormalizationState,
-    LossWeights,
-    observation_loss,
-    physics_informed_losses,
-)
+from losses import observation_loss, physics_informed_loss
 
 
-@dataclass(frozen=True)
-class TrainingResult:
-    total_loss: float
-    residual_loss: float
-    observation_loss: float
-    boundary_loss: float
-    steps: int
-    evaluations: int
+def _display_frequencies(display_freq):
+    if isinstance(display_freq, int):
+        return max(display_freq, 1), 0
+
+    if len(display_freq) == 1:
+        return max(display_freq[0], 1), 0
+
+    return max(display_freq[0], 1), max(display_freq[1], 0)
 
 
-@dataclass
-class _TrainingState:
-    start_time: float
-    print_every: int
-    steps: int = 0
-    evaluations: int = 0
-    last_total: torch.Tensor | None = None
-    last_residual: torch.Tensor | None = None
-    last_observation: torch.Tensor | None = None
-    last_boundary: torch.Tensor | None = None
-    last_grad_norm: float = 0.0
+def _gradient_norm(parameters):
+    gradient_list = []
+    for parameter in parameters:
+        if parameter.grad is not None:
+            gradient_list.append(parameter.grad.detach().flatten())
 
-
-def _grad_norm(parameters):
-    gradients = [
-        parameter.grad.detach().flatten()
-        for parameter in parameters
-        if parameter.grad is not None
-    ]
-    if not gradients:
+    if not gradient_list:
         return 0.0
-    return torch.norm(torch.cat(gradients), p=2).item()
+
+    return torch.norm(torch.cat(gradient_list), p=2).item()
 
 
-def _zero_tensor(device):
-    return torch.tensor(0.0, device=device)
+def _plot_training_state(
+    model,
+    collocation_points,
+    observation_points,
+    ref_solution,
+):
+    if ref_solution is None:
+        return
+
+    try:
+        from IPython.display import display as ipy_display
+    except ImportError:
+        return
+
+    import matplotlib.pyplot as plt
+
+    import display as display_module
+
+    figure = display_module.display_results(
+        model,
+        collocation_points,
+        ref_solution,
+        observation_points,
+        plot_col=True,
+        show=False,
+    )
+    ipy_display(figure)
+    plt.close(figure)
+
+
+def _maybe_plot_training_state(
+    before_evaluations,
+    after_evaluations,
+    plot_every,
+    model,
+    collocation_points,
+    observation_points,
+    ref_solution,
+):
+    if plot_every <= 0:
+        return
+
+    if after_evaluations // plot_every <= before_evaluations // plot_every:
+        return
+
+    _plot_training_state(
+        model,
+        collocation_points,
+        observation_points,
+        ref_solution,
+    )
+
+
+def _build_lbfgs(
+    parameters,
+    *,
+    use_line_search=True,
+):
+    return torch.optim.LBFGS(
+        parameters,
+        lr=1,
+        max_iter=1,
+        max_eval=1,
+        line_search_fn="strong_wolfe" if use_line_search else None,
+        tolerance_grad=-1,
+        tolerance_change=-1,
+    )
+
+
+def _run_lbfgs_with_evaluation_budget(
+    optimizer,
+    closure,
+    evaluation_budget,
+    *,
+    evaluation_counter,
+    on_step_completed=None,
+):
+    evaluation_budget = max(int(evaluation_budget), 0)
+    if evaluation_budget <= 0:
+        return 0
+
+    start_evaluations = evaluation_counter()
+    base_line_search = optimizer.param_groups[0]["line_search_fn"]
+    number_of_steps = 0
+
+    while evaluation_counter() - start_evaluations < evaluation_budget:
+        before_evaluations = evaluation_counter()
+        remaining_evaluations = evaluation_budget - (
+            before_evaluations - start_evaluations
+        )
+        parameter_group = optimizer.param_groups[0]
+        parameter_group["max_iter"] = 1
+        parameter_group["max_eval"] = max(remaining_evaluations, 1)
+        parameter_group["line_search_fn"] = (
+            base_line_search if remaining_evaluations > 1 else None
+        )
+
+        optimizer.step(closure)
+
+        after_evaluations = evaluation_counter()
+        if after_evaluations <= before_evaluations:
+            break
+
+        number_of_steps += 1
+        if on_step_completed is not None:
+            on_step_completed(before_evaluations, after_evaluations)
+
+    optimizer.param_groups[0]["line_search_fn"] = base_line_search
+    return number_of_steps
 
 
 class Trainer:
@@ -59,153 +147,133 @@ class Trainer:
     def fit(
         self,
         model,
-        col,
-        obs,
+        collocation_points,
+        observation_points,
         ref_solution,
         *,
         n_iter=300,
         lr=1e-2,
         display_freq=(20, 100),
     ):
-        del ref_solution
+        start_time = time.time()
+        print_every, plot_every = _display_frequencies(display_freq)
 
-        state = self._initialize_state(display_freq)
+        number_of_steps = 0
+        number_of_evaluations = 0
+        last_total_loss = torch.tensor(0.0, device=model.device)
+        last_observation_loss = torch.tensor(0.0, device=model.device)
+        last_gradient_norm = 0.0
 
         if self.optimizer_name == "lbfgs":
-            self._fit_with_lbfgs(model, col, obs, n_iter, state)
-        else:
-            self._fit_with_adamw(model, col, obs, n_iter, lr, state)
-
-        return self._build_result(model.device, state)
-
-    def _initialize_state(self, display_freq):
-        return _TrainingState(
-            start_time=time.time(),
-            print_every=max(display_freq[0], 1),
-        )
-
-    def _fit_with_adamw(self, model, col, obs, n_iter, lr, state):
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-
-        for step in range(1, n_iter + 1):
-            optimizer.zero_grad()
-            loss = observation_loss(model, obs, col)
-            loss.backward()
-
             parameters = list(model.parameters())
-            nn.utils.clip_grad_norm_(
-                parameters,
-                max_norm=self.max_grad_norm,
-                norm_type=2.0,
+            optimizer = _build_lbfgs(parameters)
+
+            # LBFGS asks for a function that recomputes the loss and gradients.
+            def grads():
+                nonlocal number_of_evaluations
+                nonlocal last_total_loss
+                nonlocal last_observation_loss
+                nonlocal last_gradient_norm
+
+                optimizer.zero_grad()
+                total_loss = observation_loss(
+                    model,
+                    observation_points,
+                    collocation_points,
+                )
+                total_loss.backward()
+
+                nn.utils.clip_grad_norm_(
+                    parameters,
+                    max_norm=self.max_grad_norm,
+                    norm_type=2.0,
+                )
+
+                number_of_evaluations += 1
+                last_total_loss = total_loss.detach().clone()
+                last_observation_loss = total_loss.detach().clone()
+                last_gradient_norm = _gradient_norm(parameters)
+
+                if number_of_evaluations % print_every == 0:
+                    print("#" * 50)
+                    print(f"Processing evaluation {number_of_evaluations}")
+                    print("-" * 25)
+                    print(f"J_obs       = {last_observation_loss.item():.2e}")
+                    print(f"||grad(J)|| = {last_gradient_norm:.2e}")
+                    print(f"time        = {time.time() - start_time:.2f} s")
+                return total_loss
+
+            def on_step_completed(before_evaluations, after_evaluations):
+                _maybe_plot_training_state(
+                    before_evaluations,
+                    after_evaluations,
+                    plot_every,
+                    model,
+                    collocation_points,
+                    observation_points,
+                    ref_solution,
+                )
+
+            number_of_steps = _run_lbfgs_with_evaluation_budget(
+                optimizer,
+                grads,
+                n_iter,
+                evaluation_counter=lambda: number_of_evaluations,
+                on_step_completed=on_step_completed,
             )
+        else:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
-            optimizer.step()
+            for step in range(1, n_iter + 1):
+                optimizer.zero_grad()
+                total_loss = observation_loss(
+                    model,
+                    observation_points,
+                    collocation_points,
+                )
+                total_loss.backward()
 
-            state.steps = step
-            state.evaluations += 1
-            state.last_grad_norm = _grad_norm(parameters)
-            self._store_observation_state(model.device, loss, state)
-            self._maybe_print_observation_progress(step, state)
+                parameters = list(model.parameters())
+                nn.utils.clip_grad_norm_(
+                    parameters,
+                    max_norm=self.max_grad_norm,
+                    norm_type=2.0,
+                )
 
-    def _fit_with_lbfgs(self, model, col, obs, n_iter, state):
-        parameters = list(model.parameters())
-        optimizer = torch.optim.LBFGS(
-            parameters,
-            lr=1,
-            max_iter=n_iter - 1,
-            max_eval=10 * n_iter,
-            line_search_fn="strong_wolfe",
-            tolerance_grad=-1,
-            tolerance_change=-1,
-        )
+                optimizer.step()
 
-        grads = partial(
-            self._compute_observation_gradients,
-            optimizer=optimizer,
-            model=model,
-            col=col,
-            obs=obs,
-            parameters=parameters,
-            state=state,
-        )
-        optimizer.step(grads)
-        state.steps = 1
+                number_of_steps = step
+                number_of_evaluations += 1
+                last_total_loss = total_loss.detach().clone()
+                last_observation_loss = total_loss.detach().clone()
+                last_gradient_norm = _gradient_norm(parameters)
 
-    def _compute_observation_gradients(
-        self,
-        *,
-        optimizer,
-        model,
-        col,
-        obs,
-        parameters,
-        state,
-    ):
-        optimizer.zero_grad()
-        loss = observation_loss(model, obs, col)
-        loss.backward()
+                if step % print_every == 0:
+                    print("#" * 50)
+                    print(f"Processing iteration {step}")
+                    print("-" * 25)
+                    print(f"J_obs       = {last_observation_loss.item():.2e}")
+                    print(f"||grad(J)|| = {last_gradient_norm:.2e}")
+                    print(f"time        = {time.time() - start_time:.2f} s")
+                if plot_every > 0 and step % plot_every == 0:
+                    _plot_training_state(
+                        model,
+                        collocation_points,
+                        observation_points,
+                        ref_solution,
+                    )
 
-        nn.utils.clip_grad_norm_(
-            parameters,
-            max_norm=self.max_grad_norm,
-            norm_type=2.0,
-        )
-
-        state.evaluations += 1
-        state.last_grad_norm = _grad_norm(parameters)
-        self._store_observation_state(model.device, loss, state)
-        self._maybe_print_observation_progress(state.evaluations, state)
-        return loss
-
-    def _store_observation_state(self, device, loss, state):
-        state.last_total = loss.detach().clone()
-        state.last_residual = _zero_tensor(device)
-        state.last_observation = loss.detach().clone()
-        state.last_boundary = _zero_tensor(device)
-
-    def _maybe_print_observation_progress(self, step, state):
-        if step % state.print_every != 0:
-            return
-
-        print("#" * 50)
-        print(f"Processing iteration {step}")
-        print("-" * 25)
-        print(f"J_obs       = {state.last_observation.item():.2e}")
-        print(f"||grad(J)|| = {state.last_grad_norm:.2e}")
-        print(f"time        = {time.time() - state.start_time:.2f} s")
-
-    def _build_result(self, device, state):
-        total = state.last_total if state.last_total is not None else _zero_tensor(device)
-        residual = (
-            state.last_residual
-            if state.last_residual is not None
-            else _zero_tensor(device)
-        )
-        observation = (
-            state.last_observation
-            if state.last_observation is not None
-            else _zero_tensor(device)
-        )
-        boundary = (
-            state.last_boundary
-            if state.last_boundary is not None
-            else _zero_tensor(device)
-        )
-
-        return TrainingResult(
-            total_loss=total.item(),
-            residual_loss=residual.item(),
-            observation_loss=observation.item(),
-            boundary_loss=boundary.item(),
-            steps=state.steps,
-            evaluations=state.evaluations,
-        )
+        return {
+            "total_loss": float(last_total_loss.item()),
+            "residual_loss": 0.0,
+            "observation_loss": float(last_observation_loss.item()),
+            "boundary_loss": 0.0,
+            "steps": number_of_steps,
+            "evaluations": number_of_evaluations,
+        }
 
 
 class PITrainer:
-    PRETRAINING_WEIGHTS = LossWeights(residual=0.0, observation=1.0, boundary=1.0)
-    FULL_WEIGHTS = LossWeights(residual=1.0, observation=1.0, boundary=1.0)
-
     def __init__(self, train_k=False, max_grad_norm=1e3):
         self.train_k = train_k
         self.max_grad_norm = max_grad_norm
@@ -213,205 +281,218 @@ class PITrainer:
     def fit(
         self,
         model,
-        col,
-        obs,
+        collocation_points,
+        observation_points,
         ref_solution,
         *,
         pre_train_iter=100,
         alter_steps=4,
         alter_freq=(40, 10),
-        normalize_losses=True,
+        scale_losses=True,
         display_freq=(20, 100),
     ):
-        del ref_solution
+        print_every, plot_every = _display_frequencies(display_freq)
 
-        state = self._initialize_state(display_freq)
-        normalization_state = self._initialize_normalization_state(normalize_losses)
+        training_state = {
+            "start_time": time.time(),
+            "print_every": print_every,
+            "plot_every": plot_every,
+            "number_of_steps": 0,
+            "number_of_evaluations": 0,
+            "last_total_loss": torch.tensor(0.0, device=model.device),
+            "last_residual_loss": torch.tensor(0.0, device=model.device),
+            "last_observation_loss": torch.tensor(0.0, device=model.device),
+            "last_boundary_loss": torch.tensor(0.0, device=model.device),
+            "last_gradient_norm": 0.0,
+        }
 
-        # Step 1: pretrain the neural network on observations and boundary condition only.
+        if scale_losses:
+            loss_scales = {
+                "residual": None,
+                "observation": None,
+                "boundary": None,
+            }
+        else:
+            loss_scales = None
+
+        # Step 1: pretrain the neural network on observations and boundary only.
         self._run_lbfgs_phase(
             model,
-            col,
-            obs,
+            collocation_points,
+            observation_points,
             list(model.network_parameters()),
             pre_train_iter,
-            self.PRETRAINING_WEIGHTS,
-            normalize_losses,
-            normalization_state,
-            state,
+            lambda_residual=0.0,
+            lambda_observation=1.0,
+            lambda_boundary=1.0,
+            scale_losses=scale_losses,
+            loss_scales=loss_scales,
+            ref_solution=ref_solution,
+            training_state=training_state,
         )
 
+        # Step 2: alternate between the parameter update and the network update.
         for _ in range(alter_steps):
-            # Step 2a: if requested, update the physical parameter k with the full PI loss.
             if self.train_k:
                 self._run_lbfgs_phase(
                     model,
-                    col,
-                    obs,
+                    collocation_points,
+                    observation_points,
                     [model.k],
                     alter_freq[1],
-                    self.FULL_WEIGHTS,
-                    normalize_losses,
-                    normalization_state,
-                    state,
+                    lambda_residual=1.0,
+                    lambda_observation=1.0,
+                    lambda_boundary=1.0,
+                    scale_losses=scale_losses,
+                    loss_scales=loss_scales,
+                    ref_solution=ref_solution,
+                    training_state=training_state,
                 )
 
-            # Step 2b: update the neural network weights with the full PI loss.
             self._run_lbfgs_phase(
                 model,
-                col,
-                obs,
+                collocation_points,
+                observation_points,
                 list(model.network_parameters()),
                 alter_freq[0],
-                self.FULL_WEIGHTS,
-                normalize_losses,
-                normalization_state,
-                state,
+                lambda_residual=1.0,
+                lambda_observation=1.0,
+                lambda_boundary=1.0,
+                scale_losses=scale_losses,
+                loss_scales=loss_scales,
+                ref_solution=ref_solution,
+                training_state=training_state,
             )
 
-        return self._build_result(model.device, state)
-
-    def _initialize_state(self, display_freq):
-        return _TrainingState(
-            start_time=time.time(),
-            print_every=max(display_freq[0], 1),
-        )
-
-    def _initialize_normalization_state(self, normalize_losses):
-        if not normalize_losses:
-            return None
-        return LossNormalizationState()
+        return {
+            "total_loss": float(training_state["last_total_loss"].item()),
+            "residual_loss": float(training_state["last_residual_loss"].item()),
+            "observation_loss": float(
+                training_state["last_observation_loss"].item()
+            ),
+            "boundary_loss": float(training_state["last_boundary_loss"].item()),
+            "steps": training_state["number_of_steps"],
+            "evaluations": training_state["number_of_evaluations"],
+        }
 
     def _run_lbfgs_phase(
         self,
         model,
-        col,
-        obs,
+        collocation_points,
+        observation_points,
         parameters,
         max_iter,
-        weights,
-        normalize_losses,
-        normalization_state,
-        state,
-    ):
-        parameters = [
-            parameter for parameter in parameters if parameter.requires_grad
-        ]
-        if not parameters or max_iter <= 0:
-            return
-
-        optimizer = torch.optim.LBFGS(
-            parameters,
-            lr=1,
-            max_iter=max_iter - 1,
-            max_eval=10 * max_iter,
-            line_search_fn="strong_wolfe",
-            tolerance_grad=-1,
-            tolerance_change=-1,
-        )
-        grads = partial(
-            self._compute_physics_informed_gradients,
-            optimizer=optimizer,
-            model=model,
-            col=col,
-            obs=obs,
-            parameters=parameters,
-            weights=weights,
-            normalize_losses=normalize_losses,
-            normalization_state=normalization_state,
-            state=state,
-        )
-        optimizer.step(grads)
-        state.steps += 1
-
-    def _compute_physics_informed_gradients(
-        self,
         *,
-        optimizer,
-        model,
-        col,
-        obs,
-        parameters,
-        weights,
-        normalize_losses,
-        normalization_state,
-        state,
+        lambda_residual,
+        lambda_observation,
+        lambda_boundary,
+        scale_losses,
+        loss_scales,
+        ref_solution,
+        training_state,
     ):
-        optimizer.zero_grad()
+        trainable_parameters = []
+        for parameter in parameters:
+            if parameter.requires_grad:
+                trainable_parameters.append(parameter)
 
-        losses = physics_informed_losses(
-            model,
-            col,
-            obs,
-            weights=weights,
-            normalize=normalize_losses,
-            state=normalization_state,
-        )
-        total = losses.total
-        total.backward()
-
-        nn.utils.clip_grad_norm_(
-            parameters,
-            max_norm=self.max_grad_norm,
-            norm_type=2.0,
-        )
-
-        if self.train_k:
-            model.clamp_parameters()
-
-        state.evaluations += 1
-        state.last_grad_norm = _grad_norm(parameters)
-        self._store_physics_informed_state(losses, total, state)
-        self._maybe_print_physics_informed_progress(model, state)
-        return total
-
-    def _store_physics_informed_state(self, losses, total, state):
-        state.last_total = total.detach().clone()
-        state.last_residual = losses.residual.detach().clone()
-        state.last_observation = losses.observation.detach().clone()
-        state.last_boundary = losses.boundary.detach().clone()
-
-    def _maybe_print_physics_informed_progress(self, model, state):
-        if state.evaluations % state.print_every != 0:
+        if not trainable_parameters or max_iter <= 0:
             return
 
-        print("#" * 50)
-        print(f"Processing evaluation {state.evaluations}")
-        print("-" * 25)
-        print(
-            "J           = "
-            f"{state.last_total.item():.2e} "
-            f"(residual : {state.last_residual.item():.2e}, "
-            f"obs : {state.last_observation.item():.2e}, "
-            f"BC : {state.last_boundary.item():.2e})"
-        )
-        print(f"||grad(J)|| = {state.last_grad_norm:.2e}")
-        print(f"parameter    = {model.parameter_values().detach().clone()}")
-        print(f"time         = {time.time() - state.start_time:.2f} s")
-
-    def _build_result(self, device, state):
-        total = state.last_total if state.last_total is not None else _zero_tensor(device)
-        residual = (
-            state.last_residual
-            if state.last_residual is not None
-            else _zero_tensor(device)
-        )
-        observation = (
-            state.last_observation
-            if state.last_observation is not None
-            else _zero_tensor(device)
-        )
-        boundary = (
-            state.last_boundary
-            if state.last_boundary is not None
-            else _zero_tensor(device)
+        optimizer = _build_lbfgs(
+            trainable_parameters,
+            use_line_search=True,
         )
 
-        return TrainingResult(
-            total_loss=total.item(),
-            residual_loss=residual.item(),
-            observation_loss=observation.item(),
-            boundary_loss=boundary.item(),
-            steps=state.steps,
-            evaluations=state.evaluations,
+        # LBFGS asks for a function that recomputes the loss and gradients.
+        def grads():
+            optimizer.zero_grad()
+            loss_values = physics_informed_loss(
+                model,
+                collocation_points,
+                observation_points,
+                lambda_residual=lambda_residual,
+                lambda_observation=lambda_observation,
+                lambda_boundary=lambda_boundary,
+                scale_losses=scale_losses,
+                loss_scales=loss_scales,
+            )
+            total_loss = loss_values["total_loss"]
+            total_loss.backward()
+
+            nn.utils.clip_grad_norm_(
+                trainable_parameters,
+                max_norm=self.max_grad_norm,
+                norm_type=2.0,
+            )
+
+            if self.train_k:
+                model.clamp_parameters()
+
+            training_state["number_of_evaluations"] += 1
+            training_state["last_total_loss"] = total_loss.detach().clone()
+            training_state["last_residual_loss"] = loss_values[
+                "residual_loss"
+            ].detach().clone()
+            training_state["last_observation_loss"] = loss_values[
+                "observation_loss"
+            ].detach().clone()
+            training_state["last_boundary_loss"] = loss_values[
+                "boundary_loss"
+            ].detach().clone()
+            training_state["last_gradient_norm"] = _gradient_norm(
+                trainable_parameters
+            )
+
+            if (
+                training_state["number_of_evaluations"]
+                % training_state["print_every"]
+                == 0
+            ):
+                print("#" * 50)
+                print(
+                    "Processing evaluation "
+                    f"{training_state['number_of_evaluations']}"
+                )
+                print("-" * 25)
+                print(
+                    "J           = "
+                    f"{training_state['last_total_loss'].item():.2e} "
+                    f"(residual : {training_state['last_residual_loss'].item():.2e}, "
+                    f"obs : {training_state['last_observation_loss'].item():.2e}, "
+                    f"BC : {training_state['last_boundary_loss'].item():.2e})"
+                )
+                print(
+                    "||grad(J)|| = "
+                    f"{training_state['last_gradient_norm']:.2e}"
+                )
+                print(
+                    "parameter    = "
+                    f"{model.parameter_values().detach().clone()}"
+                )
+                print(
+                    "time         = "
+                    f"{time.time() - training_state['start_time']:.2f} s"
+                )
+            return total_loss
+
+        def on_step_completed(before_evaluations, after_evaluations):
+            _maybe_plot_training_state(
+                before_evaluations,
+                after_evaluations,
+                training_state["plot_every"],
+                model,
+                collocation_points,
+                observation_points,
+                ref_solution,
+            )
+
+        training_state["number_of_steps"] += _run_lbfgs_with_evaluation_budget(
+            optimizer,
+            grads,
+            max_iter,
+            evaluation_counter=lambda: training_state[
+                "number_of_evaluations"
+            ],
+            on_step_completed=on_step_completed,
         )

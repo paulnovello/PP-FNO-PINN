@@ -1,107 +1,126 @@
-from dataclasses import dataclass
-
 import torch
 
 from Backwater_model import Ks_function, bathymetry_interpolator, g, h_BC, q, regime
 from normalization import input_scale, normalize_input
 
 
-@dataclass
-class LossBreakdown:
-    total: torch.Tensor
-    residual: torch.Tensor
-    observation: torch.Tensor
-    boundary: torch.Tensor
-
-
-@dataclass(frozen=True)
-class LossWeights:
-    residual: float
-    observation: float
-    boundary: float
-
-
-@dataclass
-class LossNormalizationState:
-    residual_scale: torch.Tensor | None = None
-    observation_scale: torch.Tensor | None = None
-    boundary_scale: torch.Tensor | None = None
-
-
-def observation_loss(model, obs, col):
-    if obs.shape[0] == 0:
+def observation_loss(model, observation_points, collocation_points):
+    if observation_points.shape[0] == 0:
         return torch.tensor(0.0, device=model.device)
 
-    predictions = model(normalize_input(obs[:, :1], col))
-    observations = obs[:, 1:2]
-    return torch.norm(predictions - observations, p=2) ** 2 / obs.shape[0]
-
-
-def boundary_condition_loss(h_boundary):
-    return torch.norm(h_boundary - h_BC, p=2) ** 2
-
-
-def residual_loss(model, col):
-    domain = col
-    if not domain.requires_grad:
-        domain = domain.detach().clone().requires_grad_(True)
-
-    n_col = domain.shape[0]
-    parameter_function = Ks_function(domain, model.parameter_values(), col)
-    b_prime = bathymetry_interpolator(model.device, domain)[1]
-    normalized_domain = (
-        normalize_input(domain, col).detach().clone().requires_grad_(True)
+    # Step 1: normalize the observation coordinates before using the model.
+    observation_coordinates = observation_points[:, :1]
+    normalized_observation_coordinates = normalize_input(
+        observation_coordinates,
+        collocation_points,
     )
 
-    h = model(normalized_domain).clamp(min=1e-3)
-    h_x = torch.autograd.grad(
-        h,
-        normalized_domain,
-        grad_outputs=torch.ones_like(h),
+    # Step 2: compare the model prediction to the observed water height.
+    predicted_observations = model(normalized_observation_coordinates)
+    true_observations = observation_points[:, 1:2]
+    observation_error = predicted_observations - true_observations
+
+    return torch.norm(observation_error, p=2) ** 2 / observation_points.shape[0]
+
+
+def boundary_condition_loss(boundary_value):
+    boundary_error = boundary_value - h_BC
+    return torch.norm(boundary_error, p=2) ** 2
+
+
+def residual_loss(model, collocation_points):
+    x = collocation_points
+    if not x.requires_grad:
+        x = x.detach().clone().requires_grad_(True)
+
+    number_of_points = x.shape[0]
+
+    # Step 1: evaluate the physical ingredients of the PDE.
+    parameter_function = Ks_function(x, model.parameter_values(), collocation_points)
+    bathymetry_slope = bathymetry_interpolator(x)[1].to(model.device)
+
+    # Step 2: predict the water height on normalized coordinates.
+    normalized_x = normalize_input(x, collocation_points).detach().clone()
+    normalized_x.requires_grad_(True)
+    predicted_height = model(normalized_x).clamp(min=1e-3)
+
+    # Step 3: convert the derivative back to the original x scale.
+    height_gradient = torch.autograd.grad(
+        predicted_height,
+        normalized_x,
+        grad_outputs=torch.ones_like(predicted_height),
         create_graph=True,
         retain_graph=True,
-    )[0] / input_scale(col)
+    )[0]
+    x_scale = input_scale(collocation_points)
+    height_gradient = height_gradient / x_scale
 
-    froude = q / (g * h**3) ** (1 / 2)
-    friction = q**2 / (parameter_function**2 * h ** (10 / 3))
-    residual = h_x + (b_prime + friction) / (1 - froude**2)
-    return torch.norm(residual, p=2) ** 2 / n_col
+    # Step 4: build the backwater residual.
+    froude_number = q / (g * predicted_height**3) ** (1 / 2)
+    friction_term = q**2 / (parameter_function**2 * predicted_height ** (10 / 3))
+    residual = height_gradient + (bathymetry_slope + friction_term) / (
+        1 - froude_number**2
+    )
+
+    return torch.norm(residual, p=2) ** 2 / number_of_points
 
 
 def _safe_scale(loss_value):
-    scale = loss_value.detach().clone()
-    return torch.clamp(scale, min=1e-12)
+    copied_loss = loss_value.detach().clone()
+    return torch.clamp(copied_loss, min=1e-12)
 
 
-def physics_informed_losses(model, col, obs, *, weights, normalize, state):
+def physics_informed_loss(
+    model,
+    collocation_points,
+    observation_points,
+    *,
+    lambda_residual,
+    lambda_observation,
+    lambda_boundary,
+    scale_losses,
+    loss_scales,
+):
     if regime != "subcritical":
         raise NotImplementedError("Only the subcritical regime is supported.")
 
-    boundary_value = model(normalize_input(col, col))[-1]
-    residual = residual_loss(model, col)
-    observation = observation_loss(model, obs, col)
-    boundary = boundary_condition_loss(boundary_value)
-
-    if normalize and state is not None:
-        if state.residual_scale is None:
-            state.residual_scale = _safe_scale(residual)
-        if state.observation_scale is None:
-            state.observation_scale = _safe_scale(observation)
-        if state.boundary_scale is None:
-            state.boundary_scale = _safe_scale(boundary)
-
-        residual = residual / state.residual_scale
-        observation = observation / state.observation_scale
-        boundary = boundary / state.boundary_scale
-
-    residual = weights.residual * residual
-    observation = weights.observation * observation
-    boundary = weights.boundary * boundary
-    total = residual + observation + boundary
-
-    return LossBreakdown(
-        total=total,
-        residual=residual,
-        observation=observation,
-        boundary=boundary,
+    # Step 1: compute the three raw physical losses.
+    normalized_collocation_points = normalize_input(
+        collocation_points,
+        collocation_points,
     )
+    boundary_value = model(normalized_collocation_points)[-1]
+    residual_loss_value = residual_loss(model, collocation_points)
+    observation_loss_value = observation_loss(
+        model,
+        observation_points,
+        collocation_points,
+    )
+    boundary_loss_value = boundary_condition_loss(boundary_value)
+
+    # Step 2: optionally balance the loss magnitudes.
+    if scale_losses and loss_scales is not None:
+        if loss_scales["residual"] is None:
+            loss_scales["residual"] = _safe_scale(residual_loss_value)
+        if loss_scales["observation"] is None:
+            loss_scales["observation"] = _safe_scale(observation_loss_value)
+        if loss_scales["boundary"] is None:
+            loss_scales["boundary"] = _safe_scale(boundary_loss_value)
+
+        residual_loss_value = residual_loss_value / loss_scales["residual"]
+        observation_loss_value = observation_loss_value / loss_scales["observation"]
+        boundary_loss_value = boundary_loss_value / loss_scales["boundary"]
+
+    # Step 3: apply the phase weights and add everything together.
+    residual_loss_value = lambda_residual * residual_loss_value
+    observation_loss_value = lambda_observation * observation_loss_value
+    boundary_loss_value = lambda_boundary * boundary_loss_value
+    total_loss = residual_loss_value + observation_loss_value + boundary_loss_value
+
+    return {
+        "total_loss": total_loss,
+        "residual_loss": residual_loss_value,
+        "observation_loss": observation_loss_value,
+        "boundary_loss": boundary_loss_value,
+        "loss_scales": loss_scales,
+    }
