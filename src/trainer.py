@@ -290,9 +290,6 @@ class PITrainer:
         alter_freq=(40, 10),
         scale_losses=True,
         display_freq=(20, 100),
-        lambda_residual=1.0,
-        lambda_observation=1.0,
-        lambda_boundary=1.0,
     ):
         print_every, plot_every = _display_frequencies(display_freq)
 
@@ -323,11 +320,11 @@ class PITrainer:
             model,
             collocation_points,
             observation_points,
-            parameters=list(model.network_parameters()),
-            max_iter=pre_train_iter,
+            list(model.network_parameters()),
+            pre_train_iter,
             lambda_residual=0.0,
-            lambda_observation=lambda_observation,
-            lambda_boundary=lambda_boundary,
+            lambda_observation=1.0,
+            lambda_boundary=1.0,
             scale_losses=scale_losses,
             loss_scales=loss_scales,
             ref_solution=ref_solution,
@@ -337,9 +334,35 @@ class PITrainer:
         # Step 2: alternate between the parameter update and the network update.
         for _ in range(alter_steps):
             if self.train_k:
-                # TODO: lbfgs on k
+                self._run_lbfgs_phase(
+                    model,
+                    collocation_points,
+                    observation_points,
+                    [model.k],
+                    alter_freq[1],
+                    lambda_residual=1.0,
+                    lambda_observation=1.0,
+                    lambda_boundary=1.0,
+                    scale_losses=scale_losses,
+                    loss_scales=loss_scales,
+                    ref_solution=ref_solution,
+                    training_state=training_state,
+                )
 
-            # TODO: lbfgs on model parameters
+            self._run_lbfgs_phase(
+                model,
+                collocation_points,
+                observation_points,
+                list(model.network_parameters()),
+                alter_freq[0],
+                lambda_residual=1.0,
+                lambda_observation=1.0,
+                lambda_boundary=1.0,
+                scale_losses=scale_losses,
+                loss_scales=loss_scales,
+                ref_solution=ref_solution,
+                training_state=training_state,
+            )
 
         return {
             "total_loss": float(training_state["last_total_loss"].item()),

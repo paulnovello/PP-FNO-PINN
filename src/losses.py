@@ -36,24 +36,31 @@ def residual_loss(model, collocation_points):
     number_of_points = x.shape[0]
 
     # Step 1: evaluate the physical ingredients of the PDE.
-    parameter_function = Ks_function(x, model.parameter_values(), collocation_points)
+    Ks_trainable = Ks_function(x, model.parameter_values(), collocation_points)
     bathymetry_slope = bathymetry_interpolator(x)[1].to(model.device)
 
     # Step 2: predict the water height on normalized coordinates.
     normalized_x = normalize_input(x, collocation_points).detach().clone()
     normalized_x.requires_grad_(True)
+    predicted_height = model(normalized_x).clamp(min=1e-3)
 
-
-    # TODO: compute predicted_height. Clam its value using .clamp(min=1e-3)
-
-    # Step 3: compute the derivatives.
-    # TODO: compute height_gradient using torch.autograd. Use grad_outputs=torch.ones_like(something). What value should you use for rcreate_graph and retain_graph ? At the end, add a [0].
-
+    # Step 3: convert the derivative back to the original x scale.
+    height_gradient = torch.autograd.grad(
+        predicted_height,
+        normalized_x,
+        grad_outputs=torch.ones_like(predicted_height),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
     x_scale = input_scale(collocation_points)
     height_gradient = height_gradient / x_scale
 
     # Step 4: build the backwater residual.
-    # TODO: build residual using the Back Water equation
+    froude_number = q / (g * predicted_height**3) ** (1 / 2)
+    friction_term = q**2 / (Ks_trainable**2 * predicted_height ** (10 / 3))
+    residual = height_gradient + (bathymetry_slope + friction_term) / (
+        1 - froude_number**2
+    )
 
     return torch.norm(residual, p=2) ** 2 / number_of_points
 
@@ -105,7 +112,10 @@ def physics_informed_loss(
         boundary_loss_value = boundary_loss_value / loss_scales["boundary"]
 
     # Step 3: apply the phase weights and add everything together.
-    # TODO: Assemble the total loss using lambdas
+    residual_loss_value = lambda_residual * residual_loss_value
+    observation_loss_value = lambda_observation * observation_loss_value
+    boundary_loss_value = lambda_boundary * boundary_loss_value
+    total_loss = residual_loss_value + observation_loss_value + boundary_loss_value
 
     return {
         "total_loss": total_loss,
