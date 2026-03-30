@@ -23,21 +23,15 @@ class FNO1dLayer(nn.Module):
             x = x.unsqueeze(0)
 
         x = x.transpose(1, 2)
-        x_fourier = torch.fft.rfft(x, dim=-1)
+        # TODO apply torch.fft.rfft to obtain x_fourier
         number_of_kept_modes = min(self.n_modes, x_fourier.shape[-1])
 
         transformed_fourier = torch.zeros_like(x_fourier)
         for mode_index in range(number_of_kept_modes):
-            input_mode = x_fourier[:, :, mode_index]
-            mode_weights = self.spectral_weights[:, :, mode_index]
-            transformed_fourier[:, :, mode_index] = input_mode @ mode_weights
+            # TODO: populate transformed_fourier for each mode_index using self.spectral_weights
 
-        x_back_to_space = torch.fft.irfft(
-            transformed_fourier,
-            n=x.shape[-1],
-            dim=-1,
-        )
-        pointwise_output = self.pointwise_conv(x)
+        # TODO: apply torch.fft.irfft to obtain x_back_to_space from transformed_fourier
+        # TODO: get pointwise_output using the conv layer to prepare the residual connection 
 
         return (x_back_to_space + pointwise_output).transpose(1, 2)
 
@@ -57,9 +51,8 @@ class FNO(nn.Module):
         if seed is not None:
             torch.manual_seed(seed)
 
-        self.input_encoder = nn.Conv1d(1, n_channels, kernel_size=1)
-        self.fno_layer_1 = FNO1dLayer(n_channels, n_modes_layer_1)
-        self.fno_layer_2 = FNO1dLayer(n_channels, n_modes_layer_2)
+        # TODO define self.input_encoder using a conv layer
+        # TODO define two FNO layers, self.fno_layer_1 and self.fno_layer_2
         self.activation = nn.GELU()
         self.output_decoder_1 = nn.Conv1d(n_channels, n_channels, kernel_size=1)
         self.output_decoder_2 = nn.Conv1d(n_channels, 1, kernel_size=1)
@@ -76,13 +69,7 @@ class FNO(nn.Module):
         x = self.input_encoder(x)
         x = x.transpose(1, 2)
 
-        # Step 2: apply the first Fourier layer.
-        x = self.fno_layer_1(x)
-        x = self.activation(x)
-
-        # Step 3: apply the second Fourier layer.
-        x = self.fno_layer_2(x)
-        x = self.activation(x)
+        # TODO: apply the first and second FNO layers
 
         # Step 4: decode back to one scalar output.
         x = x.transpose(1, 2)

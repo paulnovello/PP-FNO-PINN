@@ -1,3 +1,6 @@
 .DS_Store
 .venv/*
 */__pycache__
+*/FNO_solution.py
+*/losses_solution.py
+*/trainer_solution.py
