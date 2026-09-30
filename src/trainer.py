@@ -334,10 +334,35 @@ class PITrainer:
         # Step 2: alternate between the parameter update and the network update.
         for _ in range(alter_steps):
             if self.train_k:
-                # TODO: lbfgs on k
-                pass
+                self._run_lbfgs_phase(
+                    model,
+                    collocation_points,
+                    observation_points,
+                    [model.k],
+                    alter_freq[1],
+                    lambda_residual=1.0,
+                    lambda_observation=1.0,
+                    lambda_boundary=1.0,
+                    scale_losses=scale_losses,
+                    loss_scales=loss_scales,
+                    ref_solution=ref_solution,
+                    training_state=training_state,
+                )
 
-            # TODO: lbfgs on model parameters
+            self._run_lbfgs_phase(
+                model,
+                collocation_points,
+                observation_points,
+                list(model.network_parameters()),
+                alter_freq[0],
+                lambda_residual=1.0,
+                lambda_observation=1.0,
+                lambda_boundary=1.0,
+                scale_losses=scale_losses,
+                loss_scales=loss_scales,
+                ref_solution=ref_solution,
+                training_state=training_state,
+            )
 
         return {
             "total_loss": float(training_state["last_total_loss"].item()),
