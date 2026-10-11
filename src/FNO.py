@@ -12,9 +12,14 @@ import torch.nn as nn
 class FNO1dLayer(nn.Module):
     """One 1D Fourier layer.
 
-    Combines a spectral path (a learned linear map applied to the lowest
-    Fourier modes of the input) with a pointwise path (a 1x1 convolution)
-    and returns their sum.
+    Combines a spectral path (for each channel, a learned linear map
+    applied to the lowest Fourier modes of that channel) with a pointwise
+    path (a 1x1 convolution) and returns their sum.
+
+    Note: in practice (e.g. Li et al., 2021), the spectral path also mixes
+    the channels in Fourier space. Here, for simplicity, each channel is
+    transformed independently and channels are only mixed by the 1x1
+    convolution.
 
     Args:
         n_channels: number of input and output channels.
@@ -29,9 +34,9 @@ class FNO1dLayer(nn.Module):
 
         self.pointwise_conv = nn.Conv1d(n_channels, n_channels, kernel_size=1)
         self.spectral_weights = nn.Parameter(
-            torch.randn(n_channels, n_channels, n_modes, dtype=torch.cfloat)
-            / (n_channels * max(n_modes, 1))
-        )
+            torch.randn(n_channels, n_modes, n_modes, dtype=torch.cfloat)
+            / max(n_modes, 1)
+        )  # R in course slides
 
     def forward(self, input_tensor):
         """Apply the layer.
@@ -54,8 +59,10 @@ class FNO1dLayer(nn.Module):
         number_of_kept_modes = min(self.n_modes, x_fourier.shape[-1])
 
         transformed_fourier = torch.zeros_like(x_fourier)
-        for mode_index in range(number_of_kept_modes):
-            # TODO: populate transformed_fourier for each mode_index using self.spectral_weights
+        for channel_index in range(self.n_channels):
+            # TODO: keep the first number_of_kept_modes modes of this channel, apply the
+            # (n_modes, n_modes) matrix self.spectral_weights[channel_index] and store the
+            # result in transformed_fourier (the other modes stay at zero)
             pass
 
         # TODO: apply torch.fft.irfft to obtain x_back_to_space from transformed_fourier
