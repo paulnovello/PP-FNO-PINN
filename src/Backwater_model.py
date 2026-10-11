@@ -1,3 +1,11 @@
+"""1D backwater physical model.
+
+Defines the physical constants (gravity ``g``, flow rate ``q``, downstream
+boundary condition ``h_BC``, critical height ``hc``), the bathymetry loaded
+from ``bathy.npy``, the parametrization of the Strickler coefficient
+``K_s(x)``, and an RK4 solver that produces the reference solution.
+"""
+
 from pathlib import Path
 
 import numpy as np
@@ -19,10 +27,30 @@ bathy_x = torch.arange(bathy.shape[0])
 
 
 def domain_bounds(col):
+    """Return the bounds of a 1D grid.
+
+    Args:
+        col: tensor of coordinates, any shape.
+
+    Returns:
+        Tuple ``(x_min, x_max)`` of Python floats.
+    """
     return float(torch.min(col).item()), float(torch.max(col).item())
 
 
 def numpy_interpolator(x, domain, y):
+    """Linearly interpolate ``y(domain)`` at the points ``x`` with ``np.interp``.
+
+    The result is detached from the autograd graph.
+
+    Args:
+        x: query coordinates, any shape (flattened).
+        domain: increasing coordinates where ``y`` is known.
+        y: values at ``domain``.
+
+    Returns:
+        Tensor of shape ``[len(x), 1]``.
+    """
     interpolated = np.interp(
         x.detach().clone().cpu().numpy().flatten(),
         domain.detach().clone().cpu().numpy().flatten(),
@@ -32,12 +60,37 @@ def numpy_interpolator(x, domain, y):
 
 
 def bathymetry_interpolator(x):
+    """Evaluate the bathymetry and its slope at ``x``.
+
+    Args:
+        x: coordinates in meters, any shape (flattened).
+
+    Returns:
+        Tuple ``(b, b_prime)`` of tensors of shape ``[N, 1]``: the bed
+        elevation ``b(x)`` and its slope ``b'(x)`` (precomputed by finite
+        differences on the 1 m data grid). Neither carries gradients.
+    """
     b = numpy_interpolator(x, bathy_x, bathy)
     b_prime = numpy_interpolator(x, bathy_x, bathy_prime)
     return b, b_prime
 
 
 def Ks_function(x, k, col):
+    """Build the spatially varying Strickler coefficient ``K_s(x)``.
+
+    The domain spanned by ``col`` is split into ``len(k) - 1`` equal
+    subdomains, and ``K_s`` is piecewise linear between the values ``k``
+    placed at the subdomain boundaries. A single value gives a constant
+    ``K_s``. The output is differentiable with respect to ``k``.
+
+    Args:
+        x: coordinates where ``K_s`` is evaluated, shape ``[N, 1]``.
+        k: tensor of ``p`` control values of ``K_s``.
+        col: reference grid that defines the domain bounds.
+
+    Returns:
+        Tensor of shape ``[N, 1]``.
+    """
     k = k.view(-1)
     if k.numel() == 1:
         return k.view(1, 1).expand(x.shape[0], 1)
@@ -57,6 +110,27 @@ def Ks_function(x, k, col):
 
 
 def compute_ref_solution(col, k, dx):
+    """Compute the reference water height by integrating Eq. (1) with RK4.
+
+    Integration starts at the downstream boundary (``h = h_BC``) and
+    marches upstream with step ``dx``. Only the subcritical regime is
+    supported.
+
+    Args:
+        col: collocation grid; only its bounds are used.
+        k: control values of ``K_s`` (see ``Ks_function``).
+        dx: integration step in meters.
+
+    Returns:
+        Dict with keys ``"solution"`` (h on ``"domain"``), ``"domain"``,
+        ``"dx"``, ``"critical height"``, ``"normal height"``,
+        ``"bathymetry"``, ``"bathymetry_col"`` (bathymetry on ``col``),
+        ``"parameter"`` (``k``), ``"parameter_function"`` (``K_s`` on
+        ``"domain"``) and ``"regime"``.
+
+    Raises:
+        Warning: if the solution drops below the critical height.
+    """
     if regime != "subcritical":
         raise NotImplementedError("Only the subcritical regime is supported.")
 
@@ -72,6 +146,7 @@ def compute_ref_solution(col, k, dx):
     k = k.float()
 
     def backwater_model(x, h, parameter):
+        """Right-hand side of Eq. (1), signed for upstream integration."""
         froude = q / (g * h**3) ** (1 / 2)
         return -(
             numpy_interpolator(x, domain, slope)
@@ -79,6 +154,7 @@ def compute_ref_solution(col, k, dx):
         ) / (1 - froude**2)
 
     def rk4_integrator(parameter_values):
+        """March RK4 upstream; return ``(h, normal_height)`` as column arrays."""
         index = domain.shape[0] - 1
         list_h = [h_BC]
         list_hn = [

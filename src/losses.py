@@ -1,3 +1,7 @@
+"""Loss functions: observation misfit, boundary condition, PDE residual and
+their weighted combination used to train PINNs.
+"""
+
 import torch
 
 from Backwater_model import Ks_function, bathymetry_interpolator, g, h_BC, q, regime
@@ -5,6 +9,17 @@ from normalization import input_scale, normalize_input
 
 
 def observation_loss(model, observation_points, collocation_points):
+    """Mean squared error between predicted and observed water heights.
+
+    Args:
+        model: network taking normalized coordinates.
+        observation_points: tensor ``[N_obs, 2]`` with columns ``(x, h)``.
+            If empty, the loss is 0.
+        collocation_points: reference grid used to normalize ``x``.
+
+    Returns:
+        Scalar tensor.
+    """
     if observation_points.shape[0] == 0:
         return torch.tensor(0.0, device=model.device)
 
@@ -24,11 +39,30 @@ def observation_loss(model, observation_points, collocation_points):
 
 
 def boundary_condition_loss(boundary_value):
+    """Squared error between the predicted downstream height and ``h_BC``.
+
+    Args:
+        boundary_value: predicted height at the boundary point.
+
+    Returns:
+        Scalar tensor.
+    """
     boundary_error = boundary_value - h_BC
     return torch.norm(boundary_error, p=2) ** 2
 
 
 def residual_loss(model, collocation_points):
+    """Mean squared residual of the backwater equation (Eq. 1) at the
+    collocation points.
+
+    Args:
+        model: PINN taking normalized coordinates and exposing
+            ``parameter_values()`` (the ``K_s`` control values) and ``device``.
+        collocation_points: tensor ``[N_col, 1]`` of physical coordinates.
+
+    Returns:
+        Scalar tensor ``J_res``.
+    """
     x = collocation_points
     if not x.requires_grad:
         x = x.detach().clone().requires_grad_(True)
@@ -66,6 +100,7 @@ def residual_loss(model, collocation_points):
 
 
 def _safe_scale(loss_value):
+    """Detached copy of a loss, floored at 1e-12, used as a normalization."""
     copied_loss = loss_value.detach().clone()
     return torch.clamp(copied_loss, min=1e-12)
 
@@ -81,6 +116,29 @@ def physics_informed_loss(
     scale_losses,
     loss_scales,
 ):
+    """Weighted sum of the residual, observation and boundary losses.
+
+    The boundary value is the model prediction at the last collocation
+    point (downstream, subcritical regime).
+
+    Args:
+        model: PINN.
+        collocation_points: tensor ``[N_col, 1]``.
+        observation_points: tensor ``[N_obs, 2]``; may be empty.
+        lambda_residual: weight of ``J_res``.
+        lambda_observation: weight of ``J_obs``.
+        lambda_boundary: weight of ``J_BC``.
+        scale_losses: if True, divide each loss by its value at the first
+            call so all terms start at order one.
+        loss_scales: dict with keys ``"residual"``, ``"observation"``,
+            ``"boundary"``; ``None`` entries are filled at the first call and
+            reused afterwards. Ignored if ``None``.
+
+    Returns:
+        Dict with ``"total_loss"``, the three weighted terms
+        (``"residual_loss"``, ``"observation_loss"``, ``"boundary_loss"``)
+        and ``"loss_scales"``.
+    """
     if regime != "subcritical":
         raise NotImplementedError("Only the subcritical regime is supported.")
 

@@ -1,3 +1,8 @@
+"""Script-friendly versions of the notebook experiments: builders for the
+problem, observations and models, plus end-to-end runs that return error
+metrics.
+"""
+
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +12,7 @@ import torch
 
 
 def _configure_runtime_environment():
+    """Point matplotlib and other caches to a writable temporary directory."""
     cache_root = Path("/tmp/pp_fno_pinn_cache")
     matplotlib_root = cache_root / "matplotlib"
     matplotlib_root.mkdir(parents=True, exist_ok=True)
@@ -26,16 +32,28 @@ from trainer import PITrainer, Trainer
 
 @dataclass(frozen=True)
 class LearningPdeMetrics:
+    """Result of a forward (solution-learning) run: relative L2 error on ``h``."""
+
     rmse: float
 
 
 @dataclass(frozen=True)
 class InverseProblemMetrics:
+    """Result of an inverse run: relative L2 errors on ``h`` and on ``K_s``."""
+
     solution_rmse: float
     parameter_error: float
 
 
 def default_device(use_gpu=True):
+    """Select CUDA if available and requested, else CPU, and make it the default.
+
+    Args:
+        use_gpu: whether to use CUDA when available.
+
+    Returns:
+        The selected ``torch.device``.
+    """
     if torch.cuda.is_available() and use_gpu:
         device = torch.device("cuda")
     else:
@@ -46,6 +64,15 @@ def default_device(use_gpu=True):
 
 
 def default_problem(device, seed=0):
+    """Return the true ``K_s`` control values and 100 collocation points on [0, 1000].
+
+    Args:
+        device: torch device.
+        seed: unused.
+
+    Returns:
+        Tuple ``(k_true, collocation_points)``.
+    """
     del seed
     k_true = torch.tensor([45, 38, 28, 22, 30, 45, 60, 75], device=device)
     collocation_points = torch.linspace(0, 1000, 100, device=device).view(-1, 1)
@@ -54,6 +81,18 @@ def default_problem(device, seed=0):
 
 
 def build_observations(ref_solution, n_obs, seed=None, noise_std=0, grid=True):
+    """Sample observations ``(x, h)`` from the reference solution.
+
+    Args:
+        ref_solution: dict returned by ``compute_ref_solution``.
+        n_obs: number of observations; 0 returns an empty ``[0, 2]`` tensor.
+        seed: if given, seeds ``torch`` (random selection and noise).
+        noise_std: standard deviation of Gaussian noise added to ``h``.
+        grid: if True, take evenly spaced points; otherwise random ones.
+
+    Returns:
+        Tensor of shape ``[n_obs, 2]``.
+    """
     if seed is not None:
         torch.manual_seed(seed)
 
@@ -76,6 +115,7 @@ def build_observations(ref_solution, n_obs, seed=None, noise_std=0, grid=True):
 
 
 def build_pinn(device, k_true, seed=0, k_ref=1.0, trainable_k=False):
+    """Build a ``[1, 40, 1]`` PINN. Arguments are forwarded to ``PINN``."""
     return PINN(
         device=device,
         layer_sizes=[1, 40, 1],
@@ -87,6 +127,7 @@ def build_pinn(device, k_true, seed=0, k_ref=1.0, trainable_k=False):
 
 
 def build_mlp(device, seed=0):
+    """Build a ``[1, 40, 1]`` MLP. Arguments are forwarded to ``MLP``."""
     return MLP(
         device=device,
         layer_sizes=[1, 40, 1],
@@ -95,6 +136,7 @@ def build_mlp(device, seed=0):
 
 
 def build_fno(device, seed=0, n_modes_layer_1=20, n_modes_layer_2=20, n_channels=10):
+    """Build an FNO. Arguments are forwarded to ``FNO``."""
     return FNO(
         device=device,
         n_modes_layer_1=n_modes_layer_1,
@@ -105,6 +147,7 @@ def build_fno(device, seed=0, n_modes_layer_1=20, n_modes_layer_2=20, n_channels
 
 
 def relative_l2_error(estimate, truth):
+    """Return ``||estimate - truth|| / ||truth||`` as a float."""
     estimate_array = np.asarray(estimate, dtype=np.float64)
     truth_array = np.asarray(truth, dtype=np.float64)
     return float(
@@ -114,6 +157,7 @@ def relative_l2_error(estimate, truth):
 
 
 def _build_reference_problem(seed=0, use_gpu=False):
+    """Set up the device, true ``K_s``, collocation points and RK4 reference."""
     device = default_device(use_gpu=use_gpu)
     k_true, collocation_points = default_problem(device, seed=seed)
     reference_model = build_pinn(device, k_true, seed=seed)
@@ -131,6 +175,20 @@ def run_learning_pde_solution_case(
     n_obs=40,
     use_gpu=False,
 ):
+    """Train one model to learn ``h`` with ``K_s`` known and return its error.
+
+    Args:
+        model_kind: ``"fno"``, ``"mlp"`` or ``"pinn"``.
+        seed: seed for model initialization.
+        n_obs: number of evenly spaced observations.
+        use_gpu: whether to use CUDA when available.
+
+    Returns:
+        ``LearningPdeMetrics``.
+
+    Raises:
+        ValueError: for an unknown ``model_kind``.
+    """
     device, k_true, collocation_points, ref_solution = _build_reference_problem(
         seed=seed,
         use_gpu=use_gpu,
@@ -193,6 +251,7 @@ def run_learning_pde_solution_case(
 
 
 def build_inverse_problem_model(device, k_true, seed=0):
+    """Build a PINN with trainable ``K_s`` initialized to 40 everywhere."""
     return build_pinn(
         device,
         40 * torch.ones_like(k_true),
@@ -203,6 +262,16 @@ def build_inverse_problem_model(device, k_true, seed=0):
 
 
 def run_inverse_problem_case(seed=0, n_obs=40, use_gpu=False):
+    """Recover ``K_s`` from random observations with a PINN and return the errors.
+
+    Args:
+        seed: seed for observations and model initialization.
+        n_obs: number of randomly placed observations.
+        use_gpu: whether to use CUDA when available.
+
+    Returns:
+        ``InverseProblemMetrics``.
+    """
     device, k_true, collocation_points, ref_solution = _build_reference_problem(
         seed=seed,
         use_gpu=use_gpu,

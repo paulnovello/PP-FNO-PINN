@@ -1,8 +1,24 @@
+"""Multilayer perceptron, used as the observation-only baseline and as the
+backbone of the PINN.
+"""
+
 import torch
 import torch.nn as nn
 
 
 class MLP(nn.Module):
+    """Fully connected network with tanh activations.
+
+    Weights use Xavier-normal initialization, hidden biases start at zero,
+    and the output layer has no bias.
+
+    Args:
+        device: torch device stored on the model (used by the losses).
+        layer_sizes: list of layer widths, e.g. ``[1, 40, 1]`` for one
+            input, one hidden layer of 40 units and one output.
+        seed: if given, seeds ``torch`` before initializing the weights.
+    """
+
     def __init__(self, device, layer_sizes, seed=None):
         super().__init__()
         self.device = device
@@ -37,6 +53,14 @@ class MLP(nn.Module):
         self.linear_layers.append(output_layer)
 
     def forward(self, input_tensor):
+        """Evaluate the network pointwise.
+
+        Args:
+            input_tensor: tensor of shape ``[N, layer_sizes[0]]``.
+
+        Returns:
+            Tensor of shape ``[N, layer_sizes[-1]]``.
+        """
         x = input_tensor
 
         for layer_index, linear_layer in enumerate(self.linear_layers):
@@ -47,4 +71,5 @@ class MLP(nn.Module):
         return x
 
     def network_parameters(self):
+        """Return the trainable weights of the network (all parameters)."""
         return list(self.parameters())

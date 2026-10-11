@@ -4,3 +4,6 @@
 */FNO_solution.py
 */losses_solution.py
 */trainer_solution.py
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

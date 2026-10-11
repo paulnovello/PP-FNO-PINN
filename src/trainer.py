@@ -1,3 +1,10 @@
+"""Training loops.
+
+``Trainer`` fits a model on observations only (AdamW or L-BFGS).
+``PITrainer`` trains a PINN with physics-informed losses: an observation
+pre-training followed by alternating L-BFGS phases.
+"""
+
 import time
 
 import torch
@@ -7,6 +14,7 @@ from losses import observation_loss, physics_informed_loss
 
 
 def _display_frequencies(display_freq):
+    """Parse ``display_freq`` into ``(print_every, plot_every)``."""
     if isinstance(display_freq, int):
         return max(display_freq, 1), 0
 
@@ -17,6 +25,7 @@ def _display_frequencies(display_freq):
 
 
 def _gradient_norm(parameters):
+    """Global L2 norm of the gradients of ``parameters``."""
     gradient_list = []
     for parameter in parameters:
         if parameter.grad is not None:
@@ -34,6 +43,7 @@ def _plot_training_state(
     observation_points,
     ref_solution,
 ):
+    """Display the current prediction in a notebook (no-op outside IPython)."""
     if ref_solution is None:
         return
 
@@ -67,6 +77,7 @@ def _maybe_plot_training_state(
     observation_points,
     ref_solution,
 ):
+    """Plot when the evaluation count crosses a multiple of ``plot_every``."""
     if plot_every <= 0:
         return
 
@@ -86,6 +97,7 @@ def _build_lbfgs(
     *,
     use_line_search=True,
 ):
+    """Create an L-BFGS optimizer that takes one step per ``optimizer.step``."""
     return torch.optim.LBFGS(
         parameters,
         lr=1,
@@ -105,6 +117,19 @@ def _run_lbfgs_with_evaluation_budget(
     evaluation_counter,
     on_step_completed=None,
 ):
+    """Run L-BFGS steps until ``evaluation_budget`` loss evaluations are used.
+
+    Args:
+        optimizer: optimizer from ``_build_lbfgs``.
+        closure: function that recomputes the loss and gradients.
+        evaluation_budget: maximum number of closure calls.
+        evaluation_counter: callable returning the current number of calls.
+        on_step_completed: optional callback ``(before, after)`` called
+            after each step with the evaluation counts.
+
+    Returns:
+        Number of optimizer steps taken.
+    """
     evaluation_budget = max(int(evaluation_budget), 0)
     if evaluation_budget <= 0:
         return 0
@@ -140,6 +165,13 @@ def _run_lbfgs_with_evaluation_budget(
 
 
 class Trainer:
+    """Data-driven trainer: minimizes the observation loss only.
+
+    Args:
+        optimizer_name: ``"adamw"`` (default) or ``"lbfgs"``.
+        max_grad_norm: gradient clipping threshold.
+    """
+
     def __init__(self, optimizer_name="adamw", max_grad_norm=1e3):
         self.optimizer_name = optimizer_name
         self.max_grad_norm = max_grad_norm
@@ -155,6 +187,21 @@ class Trainer:
         lr=1e-2,
         display_freq=(20, 100),
     ):
+        """Train ``model`` on the observations.
+
+        Args:
+            model: MLP or FNO taking normalized coordinates.
+            collocation_points: grid used to normalize inputs and to plot.
+            observation_points: tensor ``[N_obs, 2]`` with columns ``(x, h)``.
+            ref_solution: dict from ``compute_ref_solution``, used for plots.
+            n_iter: AdamW iterations, or loss evaluations for L-BFGS.
+            lr: AdamW learning rate (ignored by L-BFGS).
+            display_freq: ``(print_every, plot_every)``, or an int for printing
+                only; ``plot_every=0`` disables plots.
+
+        Returns:
+            Dict with the final losses, ``"steps"`` and ``"evaluations"``.
+        """
         start_time = time.time()
         print_every, plot_every = _display_frequencies(display_freq)
 
@@ -274,6 +321,14 @@ class Trainer:
 
 
 class PITrainer:
+    """Physics-informed trainer for ``PINN`` models (L-BFGS).
+
+    Args:
+        train_k: if True, ``K_s`` is also optimized (inverse problem) and
+            clamped to a physical range after each evaluation.
+        max_grad_norm: gradient clipping threshold.
+    """
+
     def __init__(self, train_k=False, max_grad_norm=1e3):
         self.train_k = train_k
         self.max_grad_norm = max_grad_norm
@@ -291,6 +346,25 @@ class PITrainer:
         scale_losses=True,
         display_freq=(20, 100),
     ):
+        """Pre-train on observations, then alternate between ``K_s`` and the network.
+
+        Args:
+            model: ``PINN``.
+            collocation_points: tensor ``[N_col, 1]`` where the residual is
+                enforced.
+            observation_points: tensor ``[N_obs, 2]``; may be empty.
+            ref_solution: dict from ``compute_ref_solution``, used for plots.
+            pre_train_iter: evaluation budget of the pre-training phase, which
+                fits observations and the boundary condition only.
+            alter_steps: number of alternating rounds.
+            alter_freq: tuple ``(network_iter, k_iter)``: evaluation budgets of
+                the network phase and of the ``K_s`` phase in each round.
+            scale_losses: normalize each loss term by its initial value.
+            display_freq: ``(print_every, plot_every)``.
+
+        Returns:
+            Dict with the final losses, ``"steps"`` and ``"evaluations"``.
+        """
         print_every, plot_every = _display_frequencies(display_freq)
 
         training_state = {
@@ -341,7 +415,7 @@ class PITrainer:
                     [model.k],
                     alter_freq[1],
                     lambda_residual=1.0,
-                    lambda_observation=1.0,
+                    lambda_observation=0.,
                     lambda_boundary=1.0,
                     scale_losses=scale_losses,
                     loss_scales=loss_scales,
@@ -391,6 +465,26 @@ class PITrainer:
         ref_solution,
         training_state,
     ):
+        """Run one L-BFGS phase on ``parameters`` with the given loss weights.
+
+        Parameters that do not require gradients are skipped; the phase is a
+        no-op if none remain or if ``max_iter <= 0``.
+
+        Args:
+            model: ``PINN``.
+            collocation_points: tensor ``[N_col, 1]``.
+            observation_points: tensor ``[N_obs, 2]``.
+            parameters: parameters to optimize in this phase.
+            max_iter: loss-evaluation budget.
+            lambda_residual: weight of ``J_res``.
+            lambda_observation: weight of ``J_obs``.
+            lambda_boundary: weight of ``J_BC``.
+            scale_losses: see ``physics_informed_loss``.
+            loss_scales: see ``physics_informed_loss``.
+            ref_solution: dict used for plots.
+            training_state: mutable dict of counters and last losses, shared
+                across phases.
+        """
         trainable_parameters = []
         for parameter in parameters:
             if parameter.requires_grad:

@@ -1,3 +1,7 @@
+"""Plotting helpers for the notebook: reference data, model predictions and
+final error.
+"""
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -7,12 +11,14 @@ from normalization import normalize_input
 
 
 def _to_numpy(tensor):
+    """Detach if needed and convert to a NumPy array."""
     if tensor.requires_grad:
         tensor = tensor.detach()
     return tensor.numpy()
 
 
 def _subdomain_indices(ref_solution):
+    """Return subdomain boundaries of ``K_s`` and their indices in ``"domain"``."""
     n_parameters = int(ref_solution["parameter"].numel())
     subdomains = torch.linspace(
         float(torch.min(ref_solution["domain"]).item()),
@@ -29,6 +35,18 @@ def _subdomain_indices(ref_solution):
 
 
 def display_data(col, ref_solution, obs, show=True):
+    """Plot the reference free surface, bathymetry, observations and ``K_s``.
+
+    Args:
+        col: collocation points (unused, kept for a uniform signature).
+        ref_solution: dict returned by ``compute_ref_solution``.
+        obs: observations, tensor of shape ``[N_obs, 2]`` with columns
+            ``(x, h)``. May be empty.
+        show: if True, display the figure; otherwise return it.
+
+    Returns:
+        ``None`` if ``show`` else the matplotlib figure.
+    """
     del col
     subdomains, indices = _subdomain_indices(ref_solution)
 
@@ -126,6 +144,22 @@ def display_data(col, ref_solution, obs, show=True):
 
 
 def display_results(model, col, ref_solution, obs, plot_col=False, show=True):
+    """Plot a model prediction against the reference solution.
+
+    If the model has ``parameter_values`` (a PINN), the estimated ``K_s``
+    is plotted next to the true one.
+
+    Args:
+        model: trained model taking normalized coordinates.
+        col: points where the model is evaluated (also used to normalize).
+        ref_solution: dict returned by ``compute_ref_solution``.
+        obs: observations ``[N_obs, 2]``; may be empty.
+        plot_col: if True, mark the collocation points.
+        show: if True, display the figure; otherwise return it.
+
+    Returns:
+        ``None`` if ``show`` else the matplotlib figure.
+    """
     subdomains, indices = _subdomain_indices(ref_solution)
     domain = _to_numpy(ref_solution["domain"])
     bathymetry = _to_numpy(ref_solution["bathymetry"])
@@ -246,6 +280,16 @@ def display_results(model, col, ref_solution, obs, plot_col=False, show=True):
 
 
 def display_training(model, col, ref_solution):
+    """Print and return the relative L2 error of the model on ``col``.
+
+    Args:
+        model: trained model taking normalized coordinates.
+        col: evaluation points; must match ``ref_solution["domain"]``.
+        ref_solution: dict returned by ``compute_ref_solution``.
+
+    Returns:
+        Relative L2 error ``||h_true - h_est|| / ||h_true||`` as a float.
+    """
     h_true = _to_numpy(ref_solution["solution"]).flatten()
     with torch.no_grad():
         h_est = _to_numpy(model(normalize_input(col, col))).flatten()
